@@ -221,6 +221,107 @@ def draw_ticker_marquee(
     return strip_w
 
 
+def _provider_strip_layout(
+    n_rows: int, scale: float, family: str, body_pt: float, title_pt: float,
+    bar: str,
+) -> dict:
+    """Pre-compute the y-offsets + total height of one provider strip.
+
+    Shared by :func:`measure_provider_strip` (window sizing, no painter needed)
+    and :func:`draw_provider_strip` (rendering) so the two never drift.
+    """
+    bf = mono_font(body_pt * scale, family=family)
+    tf = mono_font(title_pt * scale, bold=True, family=family)
+    line_h = QFontMetrics(bf).height()
+    title_h = QFontMetrics(tf).height()
+    pad = 10 * scale
+    rowgap = 7 * scale
+    barlabel_gap = 3 * scale
+    bar_h = line_h if bar == "ascii" else 6 * scale
+    rows: list[tuple[float, float]] = []
+    y = pad + title_h + rowgap
+    for _ in range(max(1, n_rows)):
+        label_y = y
+        bar_y = label_y + line_h + barlabel_gap
+        rows.append((label_y, bar_y))
+        y = bar_y + bar_h + rowgap
+    total = y - rowgap + pad
+    return {
+        "bf": bf, "tf": tf, "line_h": line_h, "title_h": title_h,
+        "pad": pad, "bar_h": bar_h, "rows": rows, "total": total,
+    }
+
+
+def measure_provider_strip(
+    n_meters: int, scale: float, family: str, body_pt: float, title_pt: float,
+    bar: str = "block",
+) -> float:
+    """Height (px) one extra-provider strip will occupy in skin mode."""
+    return _provider_strip_layout(n_meters, scale, family, body_pt, title_pt, bar)["total"]
+
+
+def draw_provider_strip(
+    p: QPainter,
+    rect: QRectF,
+    theme: dict,
+    family: str,
+    body_pt: float,
+    title_pt: float,
+    display_name: str,
+    rows: list,            # list of (label, pct, info_text, unlimited)
+    error: str,
+    scale: float,
+    bar: str = "block",
+    pad_x: float = 12.0,
+) -> float:
+    """Render one provider's section in a skin's palette/font/bar idiom.
+
+    Mirrors the look of the skin's own OSD rows (label left, info+pct right,
+    bar below) so an extra provider like Copilot blends in rather than looking
+    bolted on. Background is intentionally NOT drawn here — the overlay paints a
+    single rounded panel behind the whole stack so corners stay consistent.
+    Returns the height consumed.
+    """
+    n = len(rows) if rows else 1
+    L = _provider_strip_layout(n, scale, family, body_pt, title_pt, bar)
+    bf, tf, line_h, bar_h = L["bf"], L["tf"], L["line_h"], L["bar_h"]
+    x = rect.x() + pad_x * scale
+    w = rect.width() - 2 * pad_x * scale
+
+    accent = theme.get("accent", theme.get("text_link", theme["text_primary"]))
+    track = theme.get("very_dim", theme.get("bar_track", "#333333"))
+    sec = theme.get("text_secondary", theme["text_primary"])
+
+    # Title — provider name in the skin's accent, matching the CLAUDE titlebar.
+    draw_text(p, x, rect.y() + L["pad"] + QFontMetrics(tf).ascent(),
+              display_name, hex_to_qcolor(accent), tf, letter_spacing_px=1.0 * scale)
+
+    if not rows:
+        if error:
+            draw_text(p, x, rect.y() + L["rows"][0][0] + QFontMetrics(bf).ascent(),
+                      error, hex_to_qcolor(theme.get("text_dim", sec)), bf)
+        return L["total"]
+
+    for (label, pct, info, unlimited), (label_y, bar_y) in zip(rows, L["rows"]):
+        ly = rect.y() + label_y + QFontMetrics(bf).ascent()
+        draw_text(p, x, ly, label, hex_to_qcolor(sec), bf)
+        right = "∞" if unlimited else (f"{info} · {int(pct * 100)}%" if info else f"{int(pct * 100)}%")
+        rw = QFontMetrics(bf).horizontalAdvance(right)
+        draw_text(p, x + w - rw, ly, right, hex_to_qcolor(sec), bf)
+        if unlimited:
+            continue
+        by = rect.y() + bar_y
+        if bar == "ascii":
+            cols = max(10, int(w / max(1.0, QFontMetrics(bf).horizontalAdvance("█"))))
+            draw_ascii_bar(p, x, by + QFontMetrics(bf).ascent(), pct, cols,
+                           hex_to_qcolor(accent), hex_to_qcolor(track), bf)
+        else:
+            radius = 0.0 if bar == "hard" else bar_h / 2
+            draw_block_bar(p, x, by, w, bar_h, pct,
+                           hex_to_qcolor(track), hex_to_qcolor(accent), radius=radius)
+    return L["total"]
+
+
 def draw_sparkline_bars(
     p: QPainter,
     x: float,

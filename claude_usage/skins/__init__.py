@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from . import brutalist, dashboard, hud, receipt, strip, terminal
 from ._adapter import SkinData, SkinTickerItem, from_usage_stats
+from ._paint import draw_provider_strip, measure_provider_strip
 
 # style-name → module map used by the overlay to dispatch paint.
 SKIN_MODULES = {
@@ -27,7 +28,23 @@ SKIN_MODULES = {
     terminal.THEME["style"]:  terminal,
 }
 
+# Bar idiom each skin uses for its extra-provider strips, mirroring the bar the
+# skin draws for its own session/weekly rows. Anything unlisted gets a rounded
+# block bar.
+_EXTRA_BAR_STYLE = {
+    "terminal":  "ascii",   # █░ ASCII cells
+    "brutalist": "hard",    # sharp-cornered rectangle
+    "receipt":   "hard",
+}
+
+
+def extra_bar_style(style: str) -> str:
+    """Return the extra-provider bar idiom for a skin style name."""
+    return _EXTRA_BAR_STYLE.get(style, "block")
+
+
 __all__ = [
     "brutalist", "dashboard", "hud", "receipt", "strip", "terminal",
     "SKIN_MODULES", "SkinData", "SkinTickerItem", "from_usage_stats",
+    "draw_provider_strip", "measure_provider_strip", "extra_bar_style",
 ]

@@ -30,7 +30,13 @@ from PySide6.QtWidgets import QApplication, QWidget
 
 from claude_usage.collector import UsageStats
 from claude_usage.providers.base import Meter, ProviderSnapshot
-from claude_usage.skins import SKIN_MODULES, from_usage_stats as _skin_data_from_stats
+from claude_usage.skins import (
+    SKIN_MODULES,
+    draw_provider_strip as _skin_draw_provider_strip,
+    extra_bar_style as _skin_extra_bar_style,
+    from_usage_stats as _skin_data_from_stats,
+    measure_provider_strip as _skin_measure_provider_strip,
+)
 from claude_usage.themes import (
     BAR_STYLE_ASCII,
     BAR_STYLE_BLOCK,
@@ -471,18 +477,30 @@ class UsageOverlay(QWidget):
     def _apply_size(self) -> None:
         """Resize the window to match ``_scale``, view mode, and chrome state."""
         if self._skin is not None and not self._minimized:
-            # Skins declare their own OSD footprint — honour it instead of
-            # squeezing the handoff layout into the default's 260×122 box.
-            m = self._skin.METRICS
-            width = int(m["osd_width"] * self._scale)
-            height = int(m["osd_height"] * self._scale)
-            if self.isVisible():
-                tr = self.frameGeometry().topRight()
-                self.resize(width, height)
-                self.move(tr.x() - width, tr.y())
-            else:
-                self.resize(width, height)
-            return
+            # Skins declare their own OSD footprint for the Anthropic panel;
+            # extra providers add skin-styled strips beneath it. When there's
+            # no main panel and no extras (pre-first-data / all disabled), fall
+            # through to the default sizing path — mirroring paintEvent.
+            s = self._scale
+            drawable = self._drawable_snapshots()
+            has_main = (
+                self._last_stats is not None
+                and any(sn.provider_id == "anthropic" for sn in drawable)
+            )
+            others = [sn for sn in drawable
+                      if sn.provider_id != "anthropic" and sn.available]
+            if has_main or others:
+                m = self._skin.METRICS
+                width = int(m["osd_width"] * s)
+                height = int(m["osd_height"] * s) if has_main else 0
+                height += int(self._skin_extra_height(others, s))
+                if self.isVisible():
+                    tr = self.frameGeometry().topRight()
+                    self.resize(width, height)
+                    self.move(tr.x() - width, tr.y())
+                else:
+                    self.resize(width, height)
+                return
 
         width = int(BASE_WIDTH * self._scale)
         snaps = self._drawable_snapshots()
@@ -650,51 +668,113 @@ class UsageOverlay(QWidget):
             self._paint_minimized(p, w, h)
             return
 
-        # Skin dispatch: when a handoff skin is active, hand the whole OSD
-        # over to its dedicated `paint_osd(p, rect, data, scale)` renderer.
-        # The skin owns the entire panel — background, chrome, bars, ticker
-        # — so the default bars / gauge code paths are skipped.
-        if self._skin is not None and self._last_stats is not None:
-            from PySide6.QtCore import QRectF
-            p.setRenderHint(QPainter.Antialiasing, True)
-            p.setRenderHint(QPainter.TextAntialiasing, True)
-            data = _skin_data_from_stats(
-                self._last_stats, ticker_offset=self._ticker_offset,
+        # Skin dispatch: when a handoff skin is active, its dedicated
+        # `paint_osd(p, rect, data, scale)` renderer draws the Anthropic panel,
+        # and any extra providers (Copilot, …) are stacked beneath it as
+        # skin-styled strips so every theme is multi-provider.
+        if self._skin is not None:
+            drawable = self._drawable_snapshots()
+            has_main = (
+                self._last_stats is not None
+                and any(sn.provider_id == "anthropic" for sn in drawable)
             )
-            try:
-                s = self._scale
-                skin_h = int(self._skin.METRICS["osd_height"] * s)
-                self._skin.paint_osd(p, QRectF(0, 0, w, skin_h), data, self._scale)
-                # Draw news inside the skin's frame: above the skin's own ticker.
-                if getattr(self._skin, "WANTS_TICKER", False):
-                    pad_x = 14 * s
-                    if "news_bottom_pad" in self._skin.METRICS:
-                        news_y = skin_h - self._skin.METRICS["news_bottom_pad"] * s
-                    else:
-                        ticker_h = self._skin.METRICS.get("ticker_h", NEWS_STRIP_HEIGHT) * s
-                        news_y = skin_h - ticker_h - NEWS_STRIP_HEIGHT * s + 3 * s
-                    # Use same font as the skin's own ticker
-                    skin_fonts = getattr(self._skin, "FONTS", {})
-                    from claude_usage.skins._paint import mono_font as _skin_mono
-                    news_font = _skin_mono(
-                        9 * s,
-                        bold=True,
-                        family=skin_fonts.get("family_mono", "monospace"),
-                    )
-                    self._draw_news_strip(p, news_y, w, pad_x, s, font=news_font)
-                return
-            except Exception:
-                # Swallow skin-paint errors and fall through to default paint
-                # so a broken skin module never leaves the OSD black. The
-                # traceback goes to stderr via Qt's default path.
-                import traceback
-                traceback.print_exc()
+            others = [sn for sn in drawable
+                      if sn.provider_id != "anthropic" and sn.available]
+            if has_main or others:
+                from PySide6.QtCore import QRectF
+                p.setRenderHint(QPainter.Antialiasing, True)
+                p.setRenderHint(QPainter.TextAntialiasing, True)
+                try:
+                    s = self._scale
+                    # One rounded panel behind the whole stack so appended
+                    # strips share the skin's rounded corners. Skipped when
+                    # there are no extras, to keep the original look byte-exact.
+                    if others:
+                        radius = self._skin.METRICS.get("osd_radius", 8) * s
+                        p.setPen(Qt.NoPen)
+                        p.setBrush(_hex_to_qcolor(self._skin.THEME["bg"], 0.92))
+                        p.drawRoundedRect(QRectF(0, 0, w, h), radius, radius)
+
+                    top = 0.0
+                    if has_main:
+                        skin_h = int(self._skin.METRICS["osd_height"] * s)
+                        data = _skin_data_from_stats(
+                            self._last_stats, ticker_offset=self._ticker_offset,
+                        )
+                        self._skin.paint_osd(p, QRectF(0, 0, w, skin_h), data, s)
+                        # News inside the skin's frame, above its own ticker.
+                        if getattr(self._skin, "WANTS_TICKER", False):
+                            pad_x = 14 * s
+                            if "news_bottom_pad" in self._skin.METRICS:
+                                news_y = skin_h - self._skin.METRICS["news_bottom_pad"] * s
+                            else:
+                                ticker_h = self._skin.METRICS.get("ticker_h", NEWS_STRIP_HEIGHT) * s
+                                news_y = skin_h - ticker_h - NEWS_STRIP_HEIGHT * s + 3 * s
+                            skin_fonts = getattr(self._skin, "FONTS", {})
+                            from claude_usage.skins._paint import mono_font as _skin_mono
+                            news_font = _skin_mono(
+                                9 * s, bold=True,
+                                family=skin_fonts.get("family_mono", "monospace"),
+                            )
+                            self._draw_news_strip(p, news_y, w, pad_x, s, font=news_font)
+                        top = skin_h
+
+                    for snap in others:
+                        top += self._draw_skin_strip(p, snap, top, w, s)
+                    return
+                except Exception:
+                    # Swallow skin-paint errors and fall through to default
+                    # paint so a broken skin never leaves the OSD black.
+                    import traceback
+                    traceback.print_exc()
 
         if self._view_mode == VIEW_MODE_GAUGE:
             self._paint_gauge(p, w, h)
             return
 
         self._paint_full(p, w, h)
+
+    def _skin_strip_params(self) -> tuple[str, float, float, str, float]:
+        """(font family, body pt, title pt, bar idiom, x-padding) for the
+        active skin's extra-provider strips."""
+        fonts = getattr(self._skin, "FONTS", {})
+        metrics = getattr(self._skin, "METRICS", {})
+        family = fonts.get("family", "monospace")
+        body_pt = fonts.get("body_pt", 10)
+        title_pt = fonts.get("title_pt", 11)
+        bar = _skin_extra_bar_style(self._skin.THEME.get("style", ""))
+        pad_x = metrics.get("osd_padding", 12)
+        return family, body_pt, title_pt, bar, pad_x
+
+    def _draw_skin_strip(
+        self, p: QPainter, snap: ProviderSnapshot, top: float, w: int, s: float,
+    ) -> float:
+        """Render one extra provider as a skin-styled strip at *top*; returns
+        the height consumed so the caller can advance the cursor."""
+        from PySide6.QtCore import QRectF
+        family, body_pt, title_pt, bar, pad_x = self._skin_strip_params()
+        rows = [
+            (m.label, m.utilization,
+             _format_reset_short(m.reset_ts) or m.detail, m.unlimited)
+            for m in snap.meters
+        ]
+        height = _skin_measure_provider_strip(
+            len(snap.meters), s, family, body_pt, title_pt, bar,
+        )
+        _skin_draw_provider_strip(
+            p, QRectF(0, top, w, height), self._skin.THEME,
+            family, body_pt, title_pt, snap.display_name, rows, snap.error,
+            s, bar=bar, pad_x=pad_x,
+        )
+        return height
+
+    def _skin_extra_height(self, others: list[ProviderSnapshot], s: float) -> float:
+        """Total height the extra-provider strips will add in skin mode."""
+        family, body_pt, title_pt, bar, _pad = self._skin_strip_params()
+        return sum(
+            _skin_measure_provider_strip(len(sn.meters), s, family, body_pt, title_pt, bar)
+            for sn in others
+        )
 
     def _paint_minimized(self, p: QPainter, w: int, h: int) -> None:
         """Thin capsule showing session utilisation."""
