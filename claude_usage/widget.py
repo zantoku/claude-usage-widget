@@ -1226,16 +1226,14 @@ class ClaudeUsageApp(QObject):
             self._theme_menu.addAction(a)
             self._theme_actions[name] = a
 
-        # Providers submenu — toggle each optional metered subscription on/off.
-        # Anthropic is the widget's reason to exist, so it isn't listed (always
-        # on). Toggling forces an immediate refresh so the section appears /
+        # Providers submenu — toggle each metered subscription on/off. Every
+        # provider (including Anthropic) is a first-class, toggleable entry;
+        # toggling forces an immediate refresh so its section appears /
         # disappears without waiting for the next poll.
         from claude_usage.providers.registry import _ALL_PROVIDERS
         self._provider_menu = m.addMenu("◎  Providers")
         self._provider_actions: dict[str, QAction] = {}
         for prov in _ALL_PROVIDERS:
-            if prov.id == "anthropic":
-                continue
             a = QAction(prov.display_name.title(), self._provider_menu)
             a.setCheckable(True)
             a.setChecked(self._provider_enabled(prov.id))
@@ -1555,12 +1553,13 @@ class ClaudeUsageApp(QObject):
             "↻  Refresh (refreshing…)" if self._refreshing else "↻  Refresh"
         )
 
-        # Providers submenu — title shows how many extra providers are on, and
-        # each entry's tick mirrors the live config.
-        enabled_extra = sum(
+        # Providers submenu — title shows how many providers are on, and each
+        # entry's tick mirrors the live config.
+        enabled_count = sum(
             1 for pid in self._provider_actions if self._provider_enabled(pid)
         )
-        self._provider_menu.setTitle(f"◎  Providers · {enabled_extra} on")
+        total = len(self._provider_actions)
+        self._provider_menu.setTitle(f"◎  Providers · {enabled_count}/{total} on")
         for pid, act in self._provider_actions.items():
             act.setChecked(self._provider_enabled(pid))
 

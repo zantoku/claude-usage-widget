@@ -30,7 +30,6 @@ from PySide6.QtWidgets import QApplication, QWidget
 
 from claude_usage.collector import UsageStats
 from claude_usage.providers.base import Meter, ProviderSnapshot
-from claude_usage.providers.anthropic import snapshot_from_stats as _anthropic_snapshot
 from claude_usage.skins import SKIN_MODULES, from_usage_stats as _skin_data_from_stats
 from claude_usage.themes import (
     BAR_STYLE_ASCII,
@@ -208,6 +207,12 @@ class UsageOverlay(QWidget):
         # these as stacked sections. Empty until the first refresh; defaults to
         # a single Anthropic section for initial sizing.
         self._snapshots: list[ProviderSnapshot] = []
+        # Whether we've received at least one real update_snapshots() call. Lets
+        # us tell "no data yet" (size for the default layout) apart from "a
+        # refresh genuinely returned nothing drawable" (e.g. every provider
+        # disabled — show the empty-state placeholder instead of resurrecting
+        # an Anthropic section).
+        self._snapshots_received: bool = False
         self._scale: float = float(cfg.get("osd_scale", 1.0))
         self._opacity: float = float(cfg.get("osd_opacity", 0.75))
         self._minimized: bool = False
@@ -350,6 +355,7 @@ class UsageOverlay(QWidget):
         what the default bars/gauge paths stack into per-provider sections.
         """
         self._snapshots = list(snapshots)
+        self._snapshots_received = True
         anthropic_stats = None
         for snap in snapshots:
             if snap.provider_id == "anthropic" and isinstance(snap.rich, UsageStats):
@@ -363,13 +369,19 @@ class UsageOverlay(QWidget):
         self.update()
 
     def _drawable_snapshots(self) -> list[ProviderSnapshot]:
-        """Snapshots to actually render — available ones, or a single Anthropic
-        placeholder before the first refresh so the OSD sizes sensibly."""
+        """Snapshots to actually render.
+
+        Normally the available snapshots from the latest refresh. If a refresh
+        genuinely returned nothing drawable (every provider disabled), show an
+        empty-state placeholder rather than forcing an Anthropic section — every
+        provider, Anthropic included, is toggleable. Before the first refresh we
+        size for the default Anthropic two-gauge layout so the box doesn't pop.
+        """
         drawable = [s for s in self._snapshots if s.available]
         if drawable:
             return drawable
-        if self._last_stats is not None:
-            return [_anthropic_snapshot(self._last_stats)]
+        if self._snapshots_received:
+            return [ProviderSnapshot("", "", error="No providers enabled")]
         # Pre-first-refresh: two empty meters so the box matches the old size.
         return [ProviderSnapshot(
             "anthropic", "CLAUDE",
