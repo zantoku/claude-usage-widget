@@ -106,5 +106,52 @@ class TestUsageAPIServer(unittest.TestCase):
         self.assertEqual(out["weekly_report_text"], "[redacted — see local popup]")
 
 
+class TestProvidersArray(unittest.TestCase):
+    def setUp(self) -> None:
+        from claude_usage.providers.base import Meter, ProviderSnapshot
+        self.snaps = [
+            ProviderSnapshot("anthropic", "CLAUDE", meters=[
+                Meter("session", "Session", utilization=0.58),
+            ], rich=UsageStats()),
+            ProviderSnapshot("copilot", "COPILOT", meters=[
+                Meter("premium", "Premium", utilization=0.17, detail="83/100 left"),
+            ], rich={"plan": "business", "history": []}),
+        ]
+        self.server = UsageAPIServer(
+            host="127.0.0.1", port=0,
+            get_stats=lambda: UsageStats(session_utilization=0.58),
+            get_snapshots=lambda: self.snaps,
+        )
+        self.server.start()
+        self.base = f"http://127.0.0.1:{self.server.port}"
+
+    def tearDown(self) -> None:
+        self.server.stop()
+
+    def test_usage_includes_providers_array(self):
+        status, body = _get(self.base + "/usage")
+        self.assertEqual(status, 200)
+        # Legacy top-level field preserved for backward compatibility.
+        self.assertEqual(body["session_utilization"], 0.58)
+        ids = [p["provider_id"] for p in body["providers"]]
+        self.assertEqual(ids, ["anthropic", "copilot"])
+        copilot = body["providers"][1]
+        self.assertEqual(copilot["meters"][0]["detail"], "83/100 left")
+        # rich payload (plan, history) must not leak through the public dict.
+        self.assertNotIn("rich", copilot)
+
+    def test_no_get_snapshots_omits_providers(self):
+        server = UsageAPIServer(
+            host="127.0.0.1", port=0, get_stats=lambda: UsageStats(),
+        )
+        server.start()
+        try:
+            status, body = _get(f"http://127.0.0.1:{server.port}/usage")
+            self.assertEqual(status, 200)
+            self.assertNotIn("providers", body)
+        finally:
+            server.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

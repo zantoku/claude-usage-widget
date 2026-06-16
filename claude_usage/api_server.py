@@ -77,10 +77,14 @@ class UsageAPIServer:
         host: str,
         port: int,
         get_stats: Callable[[], UsageStats],
+        get_snapshots: Callable[[], list] | None = None,
     ) -> None:
         self.host = host
         self._requested_port = port
         self._get_stats = get_stats
+        # Optional: returns the list of ProviderSnapshot for the multi-provider
+        # `providers` array. When None, /usage stays single-provider (legacy).
+        self._get_snapshots = get_snapshots
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -118,6 +122,7 @@ class UsageAPIServer:
 
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
         get_stats = self._get_stats
+        get_snapshots = self._get_snapshots
         bound_port = self.port
 
         # DNS-rebinding defence: only honour requests whose Host header
@@ -156,7 +161,18 @@ class UsageAPIServer:
                     if self.path == "/usage":
                         stats = get_stats()
                         data = asdict(stats) if is_dataclass(stats) else dict(stats)
-                        self._send_json(_redact_external(data))
+                        data = _redact_external(data)
+                        # Multi-provider array (Copilot, …) alongside the legacy
+                        # top-level Anthropic fields. Each snapshot exposes only
+                        # meters + headline fields (no rich payload, no prompts).
+                        if get_snapshots is not None:
+                            try:
+                                data["providers"] = [
+                                    s.to_public_dict() for s in (get_snapshots() or [])
+                                ]
+                            except Exception:
+                                data["providers"] = []
+                        self._send_json(data)
                         return
                     self.send_error(404, "Not Found")
                 except Exception:

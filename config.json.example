@@ -10,5 +10,9 @@
     "notify_thresholds": [0.75, 0.90],
     "theme": "default",
     "show_ticker": true,
-    "osd_view_mode": "bars"
+    "osd_view_mode": "bars",
+    "providers": {
+        "anthropic": {"enabled": true},
+        "copilot": {"enabled": false, "token": null}
+    }
 }

@@ -87,5 +87,62 @@ class TestUsageNotifier(unittest.TestCase):
         self.assertIn("75%", body)
 
 
+class TestCheckSnapshots(unittest.TestCase):
+    def _notifier(self, **overrides):
+        cfg = {"notifications_enabled": True, "notify_thresholds": [0.75]}
+        cfg.update(overrides)
+        sent = []
+        n = UsageNotifier(cfg, sender=lambda title, body: sent.append((title, body)))
+        return n, sent
+
+    def _snaps(self, premium):
+        from claude_usage.providers.base import Meter, ProviderSnapshot
+        return [
+            ProviderSnapshot("anthropic", "CLAUDE", meters=[
+                Meter("session", "Session", utilization=0.5),
+            ]),
+            ProviderSnapshot("copilot", "COPILOT", meters=[
+                Meter("premium", "Premium", utilization=premium),
+            ]),
+        ]
+
+    def test_copilot_premium_crossing_fires(self):
+        n, sent = self._notifier()
+        n.check_snapshots(self._snaps(0.50))
+        n.check_snapshots(self._snaps(0.80))
+        titles = [t for t, _ in sent]
+        self.assertEqual(len(titles), 1)
+        self.assertIn("Copilot", titles[0])
+        self.assertIn("Premium", titles[0])
+
+    def test_unlimited_meter_never_fires(self):
+        from claude_usage.providers.base import Meter, ProviderSnapshot
+        n, sent = self._notifier()
+        snaps = [ProviderSnapshot("copilot", "COPILOT", meters=[
+            Meter("premium", "Premium", unlimited=True),
+        ])]
+        n.check_snapshots(snaps)
+        n.check_snapshots(snaps)
+        self.assertEqual(sent, [])
+
+    def test_provider_scopes_are_independent(self):
+        # Anthropic session and Copilot premium must not share crossing state.
+        from claude_usage.providers.base import Meter, ProviderSnapshot
+        n, sent = self._notifier()
+
+        def snaps(sess, prem):
+            return [
+                ProviderSnapshot("anthropic", "CLAUDE",
+                                 meters=[Meter("session", "Session", utilization=sess)]),
+                ProviderSnapshot("copilot", "COPILOT",
+                                 meters=[Meter("premium", "Premium", utilization=prem)]),
+            ]
+
+        n.check_snapshots(snaps(0.50, 0.50))
+        n.check_snapshots(snaps(0.80, 0.60))  # only session crosses 0.75
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Claude", sent[0][0])
+
+
 if __name__ == "__main__":
     unittest.main()

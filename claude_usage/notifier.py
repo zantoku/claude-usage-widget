@@ -116,16 +116,45 @@ class UsageNotifier:
         the optional ``on_threshold`` callback for any new crossings."""
         for scope, label, attr in self.SCOPES:
             util = getattr(stats, attr, 0.0) or 0.0
-            for t in self.detector.check(scope, util):
-                if self.enabled:
-                    pct_t = int(round(t * 100))
-                    pct_now = int(round(util * 100))
-                    self._send(
-                        f"Claude {label} usage at {pct_now}%",
-                        f"Crossed the {pct_t}% threshold.",
-                    )
-                if self._on_threshold is not None:
-                    try:
-                        self._on_threshold(scope, t)
-                    except Exception:
-                        pass
+            self._fire(scope, f"Claude {label}", util)
+
+    def check_snapshots(self, snapshots) -> None:
+        """Threshold-check every meter across all provider snapshots.
+
+        Scopes are keyed ``provider_id:meter.key`` so each gauge has its own
+        crossing state — a Copilot premium alert can't be masked by Anthropic's
+        session scope and vice versa. Unlimited meters are skipped (no limit to
+        cross). The Anthropic scopes keep their original ``session`` / ``weekly``
+        keys so the detector state carries over from :meth:`check_stats`.
+        """
+        for snap in snapshots:
+            if not snap.available:
+                continue
+            for meter in snap.meters:
+                if meter.unlimited:
+                    continue
+                if snap.provider_id == "anthropic":
+                    scope = meter.key
+                    label = f"Claude {meter.label}"
+                else:
+                    scope = f"{snap.provider_id}:{meter.key}"
+                    label = f"{snap.display_name.title()} {meter.label}"
+                self._fire(scope, label, meter.utilization)
+
+    def _fire(self, scope: str, label: str, util: float) -> None:
+        """Dispatch notifications + the optional callback for new crossings of
+        *scope* at the given utilization."""
+        util = util or 0.0
+        for t in self.detector.check(scope, util):
+            if self.enabled:
+                pct_t = int(round(t * 100))
+                pct_now = int(round(util * 100))
+                self._send(
+                    f"{label} usage at {pct_now}%",
+                    f"Crossed the {pct_t}% threshold.",
+                )
+            if self._on_threshold is not None:
+                try:
+                    self._on_threshold(scope, t)
+                except Exception:
+                    pass

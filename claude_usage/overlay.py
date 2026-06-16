@@ -29,6 +29,8 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QApplication, QWidget
 
 from claude_usage.collector import UsageStats
+from claude_usage.providers.base import Meter, ProviderSnapshot
+from claude_usage.providers.anthropic import snapshot_from_stats as _anthropic_snapshot
 from claude_usage.skins import SKIN_MODULES, from_usage_stats as _skin_data_from_stats
 from claude_usage.themes import (
     BAR_STYLE_ASCII,
@@ -73,6 +75,24 @@ OSD_RADIUS = 12
 OSD_BAR_HEIGHT = 6
 OSD_BAR_RADIUS = 3
 MINIMIZED_HEIGHT = 6
+
+# Bars-view vertical layout (unscaled px). A "section" is one provider; it has a
+# header line, then one row per meter, then a tail gap. These reproduce the
+# historical single-provider (CLAUDE session+weekly) spacing exactly when there
+# is just the Anthropic section, and stack cleanly when more providers are added.
+SECTION_HEADER_BASE = 7    # header text baseline below the section top
+ROW_FIRST_OFFSET = 16      # first meter row top below the section top
+ROW_PITCH = 31             # vertical distance between consecutive meter rows
+ROW_BOTTOM_TAIL = 21       # space from last row top to the section bottom
+SECTION_GAP = 10           # gap between stacked provider sections
+FOOTER_GAP = 6             # gap from the last section bottom to the footer
+# Footer block reserved below the last section in bars mode (ticker + news).
+FOOTER_BLOCK_WITH_TICKER = 38
+FOOTER_BLOCK_NEWS_ONLY = 16
+
+# Gauge-view: each provider is one horizontal band of rings.
+GAUGE_BAND_HEIGHT = 118    # per-provider band (rings + label + reset)
+GAUGE_TOP_PAD = 12
 
 # Ticker animation: seconds-per-full-loop scales inversely with viewport
 # width; we use a pixels-per-second rate instead so scale changes don't
@@ -184,6 +204,10 @@ class UsageOverlay(QWidget):
         # copy, default paint consumes the _session_pct / _weekly_pct
         # scalars set in update_stats.
         self._last_stats: UsageStats | None = None
+        # Latest per-provider snapshots — the default bars/gauge paths render
+        # these as stacked sections. Empty until the first refresh; defaults to
+        # a single Anthropic section for initial sizing.
+        self._snapshots: list[ProviderSnapshot] = []
         self._scale: float = float(cfg.get("osd_scale", 1.0))
         self._opacity: float = float(cfg.get("osd_opacity", 0.75))
         self._minimized: bool = False
@@ -317,6 +341,41 @@ class UsageOverlay(QWidget):
             self._ticker_offset = 0.0
         self.update()  # schedule a paintEvent
 
+    def update_snapshots(self, snapshots: list[ProviderSnapshot]) -> None:
+        """Apply the latest per-provider snapshots and trigger a repaint.
+
+        The Anthropic snapshot still drives the ticker / news / live-activity
+        extras (and the skin + minimized paths), so we route its rich
+        ``UsageStats`` through :meth:`update_stats`. The stored snapshot list is
+        what the default bars/gauge paths stack into per-provider sections.
+        """
+        self._snapshots = list(snapshots)
+        anthropic_stats = None
+        for snap in snapshots:
+            if snap.provider_id == "anthropic" and isinstance(snap.rich, UsageStats):
+                anthropic_stats = snap.rich
+                break
+        # update_stats() resizes (for ticker footer) and calls update(); call it
+        # before _apply_size so the height also accounts for the new section set.
+        if anthropic_stats is not None:
+            self.update_stats(anthropic_stats)
+        self._apply_size()
+        self.update()
+
+    def _drawable_snapshots(self) -> list[ProviderSnapshot]:
+        """Snapshots to actually render — available ones, or a single Anthropic
+        placeholder before the first refresh so the OSD sizes sensibly."""
+        drawable = [s for s in self._snapshots if s.available]
+        if drawable:
+            return drawable
+        if self._last_stats is not None:
+            return [_anthropic_snapshot(self._last_stats)]
+        # Pre-first-refresh: two empty meters so the box matches the old size.
+        return [ProviderSnapshot(
+            "anthropic", "CLAUDE",
+            meters=[Meter("session", "Session (5h)"), Meter("weekly", "Weekly (7d)")],
+        )]
+
     def set_view_mode(self, mode: str) -> None:
         """Switch between bar and gauge rendering; resizes the OSD to match."""
         if mode not in VIEW_MODES or mode == self._view_mode:
@@ -414,13 +473,11 @@ class UsageOverlay(QWidget):
             return
 
         width = int(BASE_WIDTH * self._scale)
+        snaps = self._drawable_snapshots()
         if self._view_mode == VIEW_MODE_GAUGE:
-            base = GAUGE_HEIGHT
+            base = self._gauge_content_height(snaps)
         else:
-            # Receipt skin always reserves the footer strip for its barcode,
-            # even if the user disabled the ticker feature.
-            wants_footer = self._ticker_enabled or self._style.decoration == "receipt"
-            base = BASE_HEIGHT + (TICKER_STRIP_HEIGHT if wants_footer else 0)
+            base = self._bars_content_height(snaps)
         height = MINIMIZED_HEIGHT if self._minimized else int(base * self._scale)
         # Preserve the top-right corner when resizing so the overlay doesn't
         # visually drift as the user scrolls to scale.
@@ -430,6 +487,33 @@ class UsageOverlay(QWidget):
             self.move(tr.x() - width, tr.y())
         else:
             self.resize(width, height)
+
+    def _wants_footer(self) -> bool:
+        """True when the bars view should reserve the bottom ticker/news strip."""
+        return self._ticker_enabled or self._style.decoration == "receipt"
+
+    @staticmethod
+    def _section_rows(snap: ProviderSnapshot) -> int:
+        """Number of body lines a section occupies (>=1 even for an error-only
+        section, so the dim message has somewhere to sit)."""
+        return max(1, len(snap.meters))
+
+    def _bars_content_height(self, snaps: list[ProviderSnapshot]) -> float:
+        """Unscaled bars-view height: every provider section + the footer."""
+        pad_y = 10
+        c = pad_y
+        for snap in snaps:
+            rows = self._section_rows(snap)
+            section_bottom = c + ROW_FIRST_OFFSET + (rows - 1) * ROW_PITCH + ROW_BOTTOM_TAIL
+            c = section_bottom + SECTION_GAP
+        last_bottom = c - SECTION_GAP if snaps else pad_y
+        footer = (FOOTER_BLOCK_WITH_TICKER if self._wants_footer()
+                  else FOOTER_BLOCK_NEWS_ONLY)
+        return last_bottom + FOOTER_GAP + footer
+
+    def _gauge_content_height(self, snaps: list[ProviderSnapshot]) -> float:
+        """Unscaled gauge-view height: one ring band per provider."""
+        return GAUGE_TOP_PAD + max(1, len(snaps)) * GAUGE_BAND_HEIGHT
 
     def _move_to_default_position(self) -> None:
         """Anchor the overlay according to the configured ``_position``.
@@ -612,11 +696,12 @@ class UsageOverlay(QWidget):
             p.drawRoundedRect(QRectF(0, 0, fill_w, h), 3, 3)
 
     def _paint_gauge(self, p: QPainter, w: int, h: int) -> None:
-        """Two circular-ring gauges (Session + Weekly) side-by-side.
+        """Circular-ring gauges, one horizontal band per provider.
 
-        Each ring fills clockwise from 12 o'clock as utilisation rises. The
-        ring colour tracks ``_bar_color`` so a turning-red session is just as
-        alarming here as in bars mode.
+        Each ring fills clockwise from 12 o'clock as utilisation rises; the ring
+        colour tracks ``_bar_color`` so a turning-red meter is as alarming here
+        as in bars mode. Unlimited meters show an ``∞`` glyph inside an empty
+        track instead of a fill.
         """
         s = self._scale
         radius = self._style.corner_radius * s
@@ -637,46 +722,75 @@ class UsageOverlay(QWidget):
                 QRectF(inset, inset, w - bw, h - bw), radius, radius,
             )
 
-        # Two columns splitting the panel; each column is one gauge stack.
-        col_w = w / 2
-        ring_d = max(50.0, min(col_w * 0.58, 80 * s))
-        ring_stroke = max(4.0, 7 * s)
-        # Centre each ring inside its column, with room below for labels.
-        for idx, (label, pct, reset_ts) in enumerate((
-            ("Session", self._session_pct, self._session_reset),
-            ("Weekly",  self._weekly_pct,  self._weekly_reset),
-        )):
-            cx = col_w * idx + col_w / 2
-            cy = 12 * s + ring_d / 2
-            fill_color = _bar_color(pct, self._theme)
-            self._draw_ring(p, cx, cy, ring_d, ring_stroke, pct, fill_color)
+        snaps = self._drawable_snapshots()
+        # Only label bands when there's more than one provider, so the single-
+        # provider gauge keeps its original clean look.
+        show_provider_label = len(snaps) > 1
+        band_h = GAUGE_BAND_HEIGHT * s
 
-            # Percentage text centred in the ring.
-            pct_text = f"{int(pct * 100)}%"
-            pct_font_pt = max(10, int(13 * s))
-            p.setFont(_mono_font(pct_font_pt, bold=True))
-            p.setPen(_hex_to_qcolor(self._theme["text_primary"]))
-            fm = p.fontMetrics()
-            pct_w = fm.horizontalAdvance(pct_text)
-            p.drawText(QPointF(cx - pct_w / 2, cy + fm.ascent() / 2 - 2 * s), pct_text)
-
-            # Label + reset beneath the ring.
-            label_y = cy + ring_d / 2 + 14 * s
-            label_font_pt = max(8, int(9 * s))
-            p.setFont(_mono_font(label_font_pt, bold=True))
-            p.setPen(_hex_to_qcolor(self._theme["text_primary"]))
-            fm = p.fontMetrics()
-            lw = fm.horizontalAdvance(label)
-            p.drawText(QPointF(cx - lw / 2, label_y), label)
-
-            reset_label = _format_reset_short(reset_ts)
-            if reset_label:
-                reset_font_pt = max(7, int(7.5 * s))
-                p.setFont(_mono_font(reset_font_pt))
+        for b, snap in enumerate(snaps):
+            by = b * band_h
+            label_pad = 0.0
+            if show_provider_label:
+                p.setFont(_mono_font(max(7, int(8 * s))))
                 p.setPen(_hex_to_qcolor(self._theme["text_dim"]))
+                p.drawText(
+                    QPointF(14 * s, by + 12 * s),
+                    self._style.title_prefix + snap.display_name,
+                )
+                label_pad = 11 * s
+
+            if not snap.meters:
+                if snap.error:
+                    p.setFont(_mono_font(max(7, int(8 * s))))
+                    p.setPen(_hex_to_qcolor(self._theme["text_dim"]))
+                    p.drawText(QPointF(14 * s, by + 40 * s), snap.error)
+                continue
+
+            n = len(snap.meters)
+            col_w = w / n
+            ring_d = max(40.0, min(col_w * 0.58, 80 * s))
+            ring_stroke = max(4.0, 7 * s)
+            ring_top = by + 12 * s + label_pad
+            for idx, meter in enumerate(snap.meters):
+                cx = col_w * idx + col_w / 2
+                cy = ring_top + ring_d / 2
+                pct = meter.utilization
+
+                if meter.unlimited:
+                    # Empty track + centred ∞ glyph.
+                    self._draw_ring(p, cx, cy, ring_d, ring_stroke, 0.0,
+                                    _bar_color(0.0, self._theme))
+                    p.setFont(_mono_font(max(12, int(16 * s)), bold=True))
+                    p.setPen(_hex_to_qcolor(self._theme["text_primary"]))
+                    fm = p.fontMetrics()
+                    gw = fm.horizontalAdvance("∞")
+                    p.drawText(QPointF(cx - gw / 2, cy + fm.ascent() / 2 - 2 * s), "∞")
+                else:
+                    self._draw_ring(p, cx, cy, ring_d, ring_stroke, pct,
+                                    _bar_color(pct, self._theme))
+                    pct_text = f"{int(pct * 100)}%"
+                    p.setFont(_mono_font(max(10, int(13 * s)), bold=True))
+                    p.setPen(_hex_to_qcolor(self._theme["text_primary"]))
+                    fm = p.fontMetrics()
+                    pct_w = fm.horizontalAdvance(pct_text)
+                    p.drawText(QPointF(cx - pct_w / 2, cy + fm.ascent() / 2 - 2 * s), pct_text)
+
+                # Label + reset beneath the ring.
+                label_y = cy + ring_d / 2 + 14 * s
+                p.setFont(_mono_font(max(8, int(9 * s)), bold=True))
+                p.setPen(_hex_to_qcolor(self._theme["text_primary"]))
                 fm = p.fontMetrics()
-                rw = fm.horizontalAdvance(reset_label)
-                p.drawText(QPointF(cx - rw / 2, label_y + 12 * s), reset_label)
+                lw = fm.horizontalAdvance(meter.label)
+                p.drawText(QPointF(cx - lw / 2, label_y), meter.label)
+
+                reset_label = _format_reset_short(meter.reset_ts) or meter.detail
+                if reset_label:
+                    p.setFont(_mono_font(max(7, int(7.5 * s))))
+                    p.setPen(_hex_to_qcolor(self._theme["text_dim"]))
+                    fm = p.fontMetrics()
+                    rw = fm.horizontalAdvance(reset_label)
+                    p.drawText(QPointF(cx - rw / 2, label_y + 12 * s), reset_label)
 
     def _draw_ring(
         self,
@@ -747,68 +861,136 @@ class UsageOverlay(QWidget):
         font_small = max(7, 7.5 * s)
         font_title = max(7, 8 * s)
 
-        # Title — optional skin-specific ASCII prefix (e.g. "┌─ " for
-        # terminal). The prefix is drawn inline so the rozet/LIVE badge
-        # positioning still works off the full string width.
-        title_font = _mono_font(int(font_title))
-        p.setFont(title_font)
-        p.setPen(_hex_to_qcolor(self._theme["text_dim"]))
-        title_y = pad_y + 7 * s
-        title_text = self._style.title_prefix + "CLAUDE"
-        p.drawText(QPointF(pad_x, title_y), title_text)
+        # Stack one section per enabled provider. The Anthropic section keeps the
+        # historical CLAUDE title + rozet + LIVE badge; others just get their
+        # name. With only Anthropic present this reproduces the original layout.
+        snaps = self._drawable_snapshots()
+        c = pad_y
+        last_bottom = c
+        for snap in snaps:
+            self._draw_section_header(p, snap, c, pad_x, w, font_title, s)
+            if snap.meters:
+                for i, meter in enumerate(snap.meters):
+                    y = c + (ROW_FIRST_OFFSET + i * ROW_PITCH) * s
+                    self._draw_meter_row(
+                        p, meter, y, w, pad_x, bar_w, bar_h, bar_r,
+                        font_label, font_small,
+                    )
+                last_row_y = c + (ROW_FIRST_OFFSET + (len(snap.meters) - 1) * ROW_PITCH) * s
+                section_bottom = last_row_y + ROW_BOTTOM_TAIL * s
+            else:
+                # Error-only section (e.g. auth failed) — one dim message line.
+                y = c + ROW_FIRST_OFFSET * s
+                if snap.error:
+                    p.setFont(_mono_font(int(font_small)))
+                    p.setPen(_hex_to_qcolor(self._theme["text_dim"]))
+                    p.drawText(QPointF(pad_x, y + 8 * s), snap.error)
+                section_bottom = y + ROW_BOTTOM_TAIL * s
+            last_bottom = section_bottom
+            c = section_bottom + SECTION_GAP * s
 
-        # Subagent rozet — only shown when > 0 so single-session users aren't
-        # bothered by a permanent "0 agents" noise. Rendered just right of
-        # CLAUDE in the theme's link colour to signal "active thing".
-        if self._active_subagents > 0:
-            title_w = p.fontMetrics().horizontalAdvance(title_text)
-            rozet = f"⚙ {self._active_subagents}"
-            p.setPen(_hex_to_qcolor(self._theme["text_link"]))
-            p.drawText(QPointF(pad_x + title_w + 6 * s, title_y), rozet)
-
-        # Live indicator — only drawn when there's recent assistant activity.
-        # Renders as `● LIVE 1.2k tok/min` right-aligned against the title.
-        if self._is_live and self._live_tpm > 0:
-            tpm = self._live_tpm
-            tpm_text = f"{tpm / 1000:.1f}k" if tpm >= 1000 else f"{int(tpm)}"
-            live_text = f"● LIVE {tpm_text} tok/min"
-            live_width = p.fontMetrics().horizontalAdvance(live_text)
-            live_x = w - pad_x - live_width
-            # Green-ish per-theme accent; fallback covers older themes.
-            p.setPen(_hex_to_qcolor(self._theme.get("live_indicator", "#4ade80")))
-            p.drawText(QPointF(live_x, pad_y + 7 * s), live_text)
-
-        # --- Session row ---
-        y = pad_y + 16 * s
-        self._draw_row(
-            p, y, w, pad_x, bar_w, bar_h, bar_r, font_label, font_small,
-            label="Session",
-            pct=self._session_pct,
-            reset_label=_format_reset_short(self._session_reset),
-        )
-
-        # --- Weekly row ---
-        y2 = y + 15 * s + bar_h + 10 * s
-        self._draw_row(
-            p, y2, w, pad_x, bar_w, bar_h, bar_r, font_label, font_small,
-            label="Weekly",
-            pct=self._weekly_pct,
-            reset_label=_format_reset_short(self._weekly_reset),
-        )
-
-        # --- Ticker strip / receipt footer (below the weekly row) ---
-        # Receipt skin replaces the scrolling ticker with a dotted
-        # perforation line + centred "— THANK YOU —" footer, matching the
-        # thermal-chit design. The actual 1D barcode lives in the popup
-        # footer (see widget.py), not here — it's a statement stamp, not
-        # part of the at-a-glance overlay.
-        footer_y = y2 + 15 * s + bar_h + 6 * s
+        # --- Ticker strip / receipt footer (below the last section) ---
+        # Receipt skin replaces the scrolling ticker with a dotted perforation
+        # line + centred "— THANK YOU —" footer. The actual 1D barcode lives in
+        # the popup footer (widget.py), not here.
+        footer_y = last_bottom + FOOTER_GAP * s
         if self._style.decoration == "receipt":
             self._paint_receipt_footer(p, pad_x, footer_y, w - 2 * pad_x, s)
         elif self._ticker_enabled:
             self._draw_ticker(p, footer_y, w, pad_x, s)
         # News strip: right after the ticker row
         self._draw_news_strip(p, footer_y + 16 * s, w, pad_x, s)
+
+    def _draw_section_header(
+        self,
+        p: QPainter,
+        snap: ProviderSnapshot,
+        c: float,
+        pad_x: float,
+        w: int,
+        font_title: float,
+        s: float,
+    ) -> None:
+        """Provider name (dim), with the Anthropic rozet + LIVE badge inline."""
+        p.setFont(_mono_font(int(font_title)))
+        p.setPen(_hex_to_qcolor(self._theme["text_dim"]))
+        title_y = c + SECTION_HEADER_BASE * s
+        title_text = self._style.title_prefix + snap.display_name
+        p.drawText(QPointF(pad_x, title_y), title_text)
+
+        if snap.provider_id != "anthropic":
+            return
+
+        # Subagent rozet — only on the Anthropic section, only when > 0.
+        if self._active_subagents > 0:
+            title_w = p.fontMetrics().horizontalAdvance(title_text)
+            rozet = f"⚙ {self._active_subagents}"
+            p.setPen(_hex_to_qcolor(self._theme["text_link"]))
+            p.drawText(QPointF(pad_x + title_w + 6 * s, title_y), rozet)
+
+        # Live indicator — `● LIVE 1.2k tok/min`, right-aligned against title.
+        if self._is_live and self._live_tpm > 0:
+            tpm = self._live_tpm
+            tpm_text = f"{tpm / 1000:.1f}k" if tpm >= 1000 else f"{int(tpm)}"
+            live_text = f"● LIVE {tpm_text} tok/min"
+            p.setFont(_mono_font(int(font_title)))
+            live_width = p.fontMetrics().horizontalAdvance(live_text)
+            p.setPen(_hex_to_qcolor(self._theme.get("live_indicator", "#4ade80")))
+            p.drawText(QPointF(w - pad_x - live_width, title_y), live_text)
+
+    def _draw_meter_row(
+        self,
+        p: QPainter,
+        meter: Meter,
+        y: float,
+        w: int,
+        pad_x: float,
+        bar_w: float,
+        bar_h: float,
+        bar_r: float,
+        font_label: float,
+        font_small: float,
+    ) -> None:
+        """One meter: label left, reset/detail + percentage right, bar below.
+
+        Unlimited meters render an ``∞`` badge in place of the percentage and
+        skip the bar entirely.
+        """
+        s = self._scale
+        p.setFont(_mono_font(int(font_label)))
+        p.setPen(_hex_to_qcolor(self._theme["text_primary"]))
+        baseline = y + 10 * s
+        label_text = meter.label
+        if self._style.label_case == "upper":
+            label_text = label_text.upper()
+        elif self._style.label_case == "lower":
+            label_text = label_text.lower()
+        p.drawText(QPointF(pad_x, baseline), label_text)
+
+        if meter.unlimited:
+            badge = "∞"
+            bw = p.fontMetrics().horizontalAdvance(badge)
+            p.drawText(QPointF(w - pad_x - bw, baseline), badge)
+            return
+
+        pct = meter.utilization
+        pct_text = f"{int(pct * 100)}%"
+        pct_width = p.fontMetrics().horizontalAdvance(pct_text)
+        p.drawText(QPointF(w - pad_x - pct_width, baseline), pct_text)
+
+        # Small right-of-label info: reset countdown if known, else the meter's
+        # own caption (e.g. Copilot's "111/300 left").
+        info = _format_reset_short(meter.reset_ts) or meter.detail
+        if info:
+            p.setFont(_mono_font(int(font_small)))
+            p.setPen(_hex_to_qcolor(self._theme["text_dim"]))
+            rw = p.fontMetrics().horizontalAdvance(info)
+            p.drawText(
+                QPointF(w - pad_x - pct_width - 8 * s - rw, baseline), info,
+            )
+
+        bar_y = y + 14 * s
+        self._draw_bar(p, pad_x, bar_y, bar_w, bar_h, bar_r, pct)
 
     def _draw_ticker(
         self,
@@ -951,53 +1133,6 @@ class UsageOverlay(QWidget):
         if item.cost_usd >= cool_thr:
             return palette["cool"]
         return palette["dim"]
-
-    def _draw_row(
-        self,
-        p: QPainter,
-        y: float,
-        w: int,
-        pad_x: float,
-        bar_w: float,
-        bar_h: float,
-        bar_r: float,
-        font_label: float,
-        font_small: float,
-        label: str,
-        pct: float,
-        reset_label: str,
-    ) -> None:
-        """Draw one row: label on the left, reset + percentage on the right, bar below."""
-        # Label + percentage baseline. Some skins (dashboard, brutalist)
-        # uppercase the row label for a datasheet feel.
-        p.setFont(_mono_font(int(font_label)))
-        p.setPen(_hex_to_qcolor(self._theme["text_primary"]))
-        baseline = y + 10 * self._scale
-        label_text = label
-        if self._style.label_case == "upper":
-            label_text = label.upper()
-        elif self._style.label_case == "lower":
-            label_text = label.lower()
-        p.drawText(QPointF(pad_x, baseline), label_text)
-
-        pct_text = f"{int(pct * 100)}%"
-        pct_width = p.fontMetrics().horizontalAdvance(pct_text)
-        p.drawText(QPointF(w - pad_x - pct_width, baseline), pct_text)
-
-        # Reset-time (between label and percentage, small font)
-        if reset_label:
-            p.setFont(_mono_font(int(font_small)))
-            p.setPen(_hex_to_qcolor(self._theme["text_dim"]))
-            rw = p.fontMetrics().horizontalAdvance(reset_label)
-            p.drawText(
-                QPointF(w - pad_x - pct_width - 8 * self._scale - rw, baseline),
-                reset_label,
-            )
-
-        # Bar — skin-specific style: ASCII block glyphs for terminal, sharp
-        # rectangle for brutalist/receipt, classic rounded pill otherwise.
-        bar_y = y + 14 * self._scale
-        self._draw_bar(p, pad_x, bar_y, bar_w, bar_h, bar_r, pct)
 
     def _paint_paper_grain(self, p: QPainter, w: int, h: int) -> None:
         """Thin horizontal stripes every 4px — thermal-paper grain texture."""

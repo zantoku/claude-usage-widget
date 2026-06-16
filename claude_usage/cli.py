@@ -15,8 +15,9 @@ from dataclasses import asdict, is_dataclass
 from typing import Sequence
 
 from claude_usage import __version__
-from claude_usage.collector import UsageStats, collect_all
+from claude_usage.collector import UsageStats
 from claude_usage.config import load_config, user_config_path
+from claude_usage.providers import collect_snapshots
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,6 +43,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _usage_stats_to_dict(stats: UsageStats) -> dict:
     return asdict(stats) if is_dataclass(stats) else dict(stats)
+
+
+def _provider_field_map(snapshots) -> dict:
+    """Flatten provider meters into dotted scalar fields for ``--field``.
+
+    e.g. ``copilot.premium_utilization``, ``copilot.premium_reset``,
+    ``copilot.premium_detail``. Lets status-bar scripts read a single number
+    without parsing the whole ``providers`` array.
+    """
+    out: dict = {}
+    for snap in snapshots:
+        for meter in snap.meters:
+            base = f"{snap.provider_id}.{meter.key}"
+            out[f"{base}_utilization"] = meter.utilization
+            out[f"{base}_reset"] = meter.reset_ts
+            out[f"{base}_detail"] = meter.detail
+            out[f"{base}_unlimited"] = meter.unlimited
+    return out
 
 
 def _default_config_path() -> str:
@@ -85,18 +104,30 @@ def run_cli(argv: Sequence[str]) -> int:
 
     if args.json or args.once or args.field:
         config = load_config(_default_config_path())
-        stats = collect_all(config)
+        snapshots = collect_snapshots(config)
+        # Anthropic UsageStats stays the top-level shape for backward compat.
+        stats = next(
+            (s.rich for s in snapshots
+             if s.provider_id == "anthropic" and isinstance(s.rich, UsageStats)),
+            UsageStats(),
+        )
         data = _usage_stats_to_dict(stats)
         # Same privacy redaction as the localhost API — never leak raw prompt
         # text through --json / --field output.
         from claude_usage.api_server import _redact_external
         data = _redact_external(data)
+        # Multi-provider array + flattened provider fields.
+        data["providers"] = [s.to_public_dict() for s in snapshots]
+        provider_fields = _provider_field_map(snapshots)
 
         if args.field is not None:
-            if args.field not in data:
+            if args.field in data:
+                value = data[args.field]
+            elif args.field in provider_fields:
+                value = provider_fields[args.field]
+            else:
                 print(f"error: unknown field {args.field!r}", file=sys.stderr)
                 return 2
-            value = data[args.field]
             # Render containers as JSON so shell pipelines can jq/grep them;
             # scalars stay in their native repr for backwards-compat with
             # existing status-bar scripts that expect raw numbers.

@@ -77,6 +77,17 @@ DEFAULT_CONFIG: Config = {
     # user minimizes / hides the OSD so it reopens the way they left it.
     "osd_minimized": False,
     "osd_visible": True,
+
+    # Metered-subscription providers. Each provider contributes its own
+    # labelled section of gauges to the OSD. Anthropic is on by default (it's
+    # the widget's reason to exist); everything else is opt-in so existing
+    # installs are unchanged until enabled. A null Copilot "token" means
+    # auto-detect from ~/.config/github-copilot/apps.json, the gh CLI, or the
+    # GH_TOKEN / GITHUB_TOKEN env vars.
+    "providers": {
+        "anthropic": {"enabled": True},
+        "copilot": {"enabled": False, "token": None},
+    },
 }
 
 

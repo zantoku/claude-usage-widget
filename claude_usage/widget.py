@@ -35,8 +35,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from claude_usage.collector import UsageStats, collect_all
+from claude_usage.collector import UsageStats
 from claude_usage.forecast import format_forecast
+from claude_usage.providers import ProviderSnapshot, collect_snapshots, enabled_providers
 from claude_usage.notifier import UsageNotifier
 from claude_usage.overlay import UsageOverlay, _hex_to_qcolor
 from claude_usage.pricing import MODEL_PRICING, calculate_cost
@@ -550,6 +551,9 @@ class UsagePopup(QWidget):
         # we can flush it on show without rebuilding the tree every 30 s
         # for a popup nobody's looking at.
         self._pending_stats: UsageStats | None = None
+        # Latest non-Anthropic provider snapshots (e.g. Copilot), rendered as
+        # their own compact sections near the top of the popup.
+        self._extra_providers: list[ProviderSnapshot] = []
 
         self._scroll = QScrollArea(self)
         self._scroll.setWidgetResizable(True)
@@ -718,6 +722,12 @@ class UsagePopup(QWidget):
             return
         self._rebuild_from(stats)
 
+    def update_extra_providers(self, extra: list[ProviderSnapshot]) -> None:
+        """Store non-Anthropic provider snapshots and rebuild if visible."""
+        self._extra_providers = list(extra)
+        if self.isVisible() and self._pending_stats is not None:
+            self._rebuild_from(self._pending_stats)
+
     def showEvent(self, event) -> None:  # noqa: N802
         """Flush any deferred stats build on first reveal — see
         :meth:`update_stats` for why hidden popups skip the rebuild."""
@@ -765,6 +775,9 @@ class UsagePopup(QWidget):
             self._add_calendar_heatmap(yearly, "Last 52 weeks")
         self._add_separator()
 
+        # --- Other providers (Copilot, …) ---
+        self._render_extra_providers()
+
         # --- Anomaly banner ---
         anomaly = getattr(stats, "anomaly", None)
         if anomaly is not None and getattr(anomaly, "is_anomaly", False):
@@ -799,6 +812,37 @@ class UsagePopup(QWidget):
         self._render_footer(stats)
 
     # ------------------------------------------------------------ sections
+
+    def _render_extra_providers(self) -> None:
+        """Compact section per non-Anthropic provider: plan, meters, sparkline."""
+        for snap in self._extra_providers:
+            plan = ""
+            history: list[dict] = []
+            if isinstance(snap.rich, dict):
+                plan = str(snap.rich.get("plan", "") or "")
+                history = snap.rich.get("history", []) or []
+            self._add_section_header(snap.display_name.title(), plan)
+
+            if snap.error and not snap.meters:
+                self._add_dim_line(snap.error, role="error", margin_bottom=12)
+                self._add_separator()
+                continue
+
+            for meter in snap.meters:
+                if meter.unlimited:
+                    self._add_dim_line(f"{meter.label}: unlimited", margin_bottom=12)
+                    continue
+                subtitle = meter.detail or _format_reset_duration(meter.reset_ts)
+                self._add_usage_row(meter.label, subtitle, meter.utilization)
+
+            if snap.error:
+                self._add_dim_line(snap.error, role="dim", margin_bottom=6)
+
+            # Sparkline from the recorded utilization history (premium slot).
+            series = [float(p.get("session", 0.0) or 0.0) for p in history][-30:]
+            if any(v > 0 for v in series):
+                self._add_sparkline(series, "Recent")
+            self._add_separator()
 
     def _render_cost_section(self, stats: UsageStats) -> None:
         today_cost = float(getattr(stats, "today_cost", 0.0) or 0.0)
@@ -993,6 +1037,7 @@ class ClaudeUsageApp(QObject):
         super().__init__()
         self.config = config
         self.stats = UsageStats()
+        self.snapshots: list[ProviderSnapshot] = []
         self._alive = True
         self._refreshing = False
         self._last_daily_report_date: str = ""
@@ -1035,6 +1080,7 @@ class ClaudeUsageApp(QObject):
                     host=config.get("api_server_host", "127.0.0.1"),
                     port=int(config.get("api_server_port", 8765)),
                     get_stats=lambda: self.stats,
+                    get_snapshots=lambda: self.snapshots,
                 )
                 self._api_server.start()
             except OSError as exc:
@@ -1180,6 +1226,25 @@ class ClaudeUsageApp(QObject):
             self._theme_menu.addAction(a)
             self._theme_actions[name] = a
 
+        # Providers submenu — toggle each optional metered subscription on/off.
+        # Anthropic is the widget's reason to exist, so it isn't listed (always
+        # on). Toggling forces an immediate refresh so the section appears /
+        # disappears without waiting for the next poll.
+        from claude_usage.providers.registry import _ALL_PROVIDERS
+        self._provider_menu = m.addMenu("◎  Providers")
+        self._provider_actions: dict[str, QAction] = {}
+        for prov in _ALL_PROVIDERS:
+            if prov.id == "anthropic":
+                continue
+            a = QAction(prov.display_name.title(), self._provider_menu)
+            a.setCheckable(True)
+            a.setChecked(self._provider_enabled(prov.id))
+            a.toggled.connect(
+                lambda checked=False, pid=prov.id: self._on_toggle_provider(pid, checked)
+            )
+            self._provider_menu.addAction(a)
+            self._provider_actions[prov.id] = a
+
         act_minimize = QAction("▭  Minimize / Restore", m)
         act_minimize.triggered.connect(self.overlay.toggle_minimized)
         m.addAction(act_minimize)
@@ -1211,6 +1276,51 @@ class ClaudeUsageApp(QObject):
 
         # Apply theme-tinted styling — kills the default Qt grey palette.
         self._apply_menu_qss()
+
+    def _provider_enabled(self, pid: str) -> bool:
+        """Whether provider *pid* is enabled in the live config (default off for
+        non-Anthropic providers)."""
+        entry = (self.config.get("providers", {}) or {}).get(pid)
+        if not isinstance(entry, dict):
+            return pid == "anthropic"
+        return bool(entry.get("enabled", pid == "anthropic"))
+
+    def _on_toggle_provider(self, pid: str, checked: bool) -> None:
+        """Enable/disable a provider, persist, and reflect it on the OSD now.
+
+        We update the visible snapshot list *optimistically* before kicking off
+        the background refresh: disabling drops the section instantly, enabling
+        shows a "Loading…" placeholder immediately. Otherwise the OSD wouldn't
+        react until the next full collect finishes — which waits on the
+        Anthropic + provider network round-trips and feels sluggish.
+        """
+        providers = self.config.setdefault("providers", {})
+        entry = providers.setdefault(pid, {})
+        entry["enabled"] = bool(checked)
+        self._persist_config()
+
+        if checked:
+            # Add a placeholder section unless we somehow already have one.
+            if not any(s.provider_id == pid for s in self.snapshots):
+                from claude_usage.providers.registry import _ALL_PROVIDERS
+                display = next(
+                    (p.display_name for p in _ALL_PROVIDERS if p.id == pid),
+                    pid.upper(),
+                )
+                self.snapshots = self.snapshots + [ProviderSnapshot(
+                    provider_id=pid, display_name=display,
+                    available=True, error="Loading…",
+                )]
+        else:
+            self.snapshots = [s for s in self.snapshots if s.provider_id != pid]
+
+        # Repaint with the optimistic list immediately…
+        self.overlay.update_snapshots(self.snapshots)
+        self.popup.update_extra_providers(
+            [s for s in self.snapshots if s.provider_id != "anthropic" and s.available]
+        )
+        # …then fetch real numbers in the background.
+        self._refresh_async()
 
     def _on_toggle_ticker(self, checked: bool) -> None:
         self.overlay.set_ticker_enabled(checked)
@@ -1394,6 +1504,7 @@ class ClaudeUsageApp(QObject):
             getattr(self, "_view_menu", None),
             getattr(self, "_theme_menu", None),
             getattr(self, "_position_menu", None),
+            getattr(self, "_provider_menu", None),
         ):
             if sub is not None:
                 sub.setStyleSheet(qss)
@@ -1402,9 +1513,8 @@ class ClaudeUsageApp(QObject):
         """Refresh dynamic labels and tick marks each time the menu opens —
         live-stats header, submenu titles showing the current selection,
         update banner visibility, and the "Updated Xs ago" footer."""
-        # Stats header — "Session 42% · Weekly 71% · ● 10.5k t/m".
-        s_pct = int((getattr(self.stats, "session_utilization", 0.0) or 0.0) * 100)
-        w_pct = int((getattr(self.stats, "weekly_utilization", 0.0) or 0.0) * 100)
+        # Stats header — per-provider headline, e.g.
+        # "CLAUDE 42%/71%  ·  COPILOT 17%  ·  ● 10.5k t/m".
         live = getattr(self.stats, "live_activity", None)
         live_txt = ""
         if live is not None and getattr(live, "is_live", False):
@@ -1413,8 +1523,20 @@ class ClaudeUsageApp(QObject):
         if self._last_refresh_ts <= 0:
             self._act_stats_header.setText("Loading…")
         else:
+            parts: list[str] = []
+            for snap in self.snapshots:
+                if not snap.available:
+                    continue
+                if snap.meters:
+                    pcts = "/".join(
+                        "∞" if m.unlimited else f"{int(m.utilization * 100)}%"
+                        for m in snap.meters
+                    )
+                    parts.append(f"{snap.display_name} {pcts}")
+                elif snap.error:
+                    parts.append(f"{snap.display_name} !")
             self._act_stats_header.setText(
-                f"Session {s_pct}%  ·  Weekly {w_pct}%{live_txt}"
+                ("  ·  ".join(parts) if parts else "Loading…") + live_txt
             )
 
         # Update banner — only visible when the GitHub release check
@@ -1432,6 +1554,15 @@ class ClaudeUsageApp(QObject):
         self._act_refresh.setText(
             "↻  Refresh (refreshing…)" if self._refreshing else "↻  Refresh"
         )
+
+        # Providers submenu — title shows how many extra providers are on, and
+        # each entry's tick mirrors the live config.
+        enabled_extra = sum(
+            1 for pid in self._provider_actions if self._provider_enabled(pid)
+        )
+        self._provider_menu.setTitle(f"◎  Providers · {enabled_extra} on")
+        for pid, act in self._provider_actions.items():
+            act.setChecked(self._provider_enabled(pid))
 
         # Submenu titles — surface the current selection so the user
         # doesn't have to drill in to know what's active.
@@ -1502,28 +1633,52 @@ class ClaudeUsageApp(QObject):
 
         def _worker() -> None:
             try:
-                stats = collect_all(self.config)
+                snapshots = collect_snapshots(self.config)
             except Exception:
-                stats = UsageStats(rate_limit_error="Collection failed")
+                snapshots = [ProviderSnapshot(
+                    "anthropic", "CLAUDE",
+                    rich=UsageStats(rate_limit_error="Collection failed"),
+                    error="Collection failed",
+                )]
             # Emit cross-thread signal; the slot runs on the GUI thread.
             if self._alive:
-                self.stats_ready.emit(stats)
+                self.stats_ready.emit(snapshots)
 
         threading.Thread(target=_worker, daemon=True).start()
 
     @Slot(object)
-    def _apply_stats(self, stats: UsageStats) -> None:
+    def _apply_stats(self, snapshots: list[ProviderSnapshot]) -> None:
         self._refreshing = False
         if not self._alive:
             return
+        self.snapshots = snapshots
+        # The Anthropic UsageStats remains the source of truth for the rich
+        # popup, weekly-report, webhooks, and the legacy JSON-API fields.
+        stats = next(
+            (s.rich for s in snapshots
+             if s.provider_id == "anthropic" and isinstance(s.rich, UsageStats)),
+            None,
+        ) or UsageStats()
         self.stats = stats
         import time as _t
         self._last_refresh_ts = _t.time()
 
-        self.overlay.update_stats(stats)
+        self.overlay.update_snapshots(snapshots)
         self.popup.update_stats(stats)
         self.skin_popup.update_stats(stats)
-        self.notifier.check_stats(stats)
+        # Extra (non-Anthropic) provider sections in the detail popup.
+        extra = [s for s in snapshots if s.provider_id != "anthropic" and s.available]
+        self.popup.update_extra_providers(extra)
+        self.notifier.check_snapshots(snapshots)
+
+        # Reconcile against the live config: if the user toggled a provider
+        # while a refresh was already in flight, the snapshots we just received
+        # reflect the *old* enabled set. Re-collect once so the OSD converges to
+        # what's actually enabled instead of waiting for the next 30s tick.
+        want = {p.id for p in enabled_providers(self.config)}
+        got = {s.provider_id for s in snapshots}
+        if want != got:
+            QTimer.singleShot(0, self._refresh_async)
 
         # Webhook: anomaly
         if getattr(stats.anomaly, "is_anomaly", False):

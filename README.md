@@ -91,6 +91,7 @@ Gauge variants for every theme are available at `screenshots/osd-gauge-<theme>.p
 
 ## Features
 
+- **Multi-provider** -- track several metered AI subscriptions side by side. Anthropic (Claude Code) is always on; **GitHub Copilot** premium-request quota is opt-in. Each provider renders its own labelled section of gauges in the OSD. The provider layer is pluggable, so adding OpenAI etc. is one module — see [Providers](#providers).
 - **Single `pip install`** -- no `apt`/`brew`/system libraries required, Qt is bundled
 - **Real API data** -- rate-limit utilisation read straight from `anthropic-ratelimit-unified-*` response headers
 - **OSD overlay** -- transparent, frameless, always-on-top; left-click opens the details popup, right-click shows a context menu
@@ -213,8 +214,41 @@ cp config.json.example config.json
 | `osd_scale` | `1.0` | OSD zoom level (0.6–2.0). Updated automatically when you scroll the mouse wheel over the OSD, so it reopens at the same size. |
 | `osd_minimized` | `false` | Whether the OSD is in its collapsed thin-strip form. Written automatically via right-click → "Minimize / Restore". |
 | `osd_visible` | `true` | Whether the OSD overlay is shown. Written on quit so the widget reopens in the same visible/hidden state. |
+| `providers` | `{anthropic: on, copilot: off}` | Which metered subscriptions to track. See [Providers](#providers). |
 
 Keys omitted from `config.json` fall back to built-in defaults. `claude_dir` is not included in the example file because the default is correct for most setups.
+
+## Providers
+
+The widget can track more than one metered AI subscription at once. Each enabled provider draws its own labelled section of gauges in the OSD (stacked, Anthropic first), and contributes to the detail popup, the JSON API, and threshold notifications.
+
+```json
+{
+    "providers": {
+        "anthropic": {"enabled": true},
+        "copilot": {"enabled": false, "token": null}
+    }
+}
+```
+
+| Provider | Default | What it shows | Authentication |
+|----------|---------|---------------|----------------|
+| `anthropic` | **on** | Session (5h) + Weekly (7d) plan utilisation, plus the full cost / heatmap / ticker detail popup | Claude Code OAuth credentials in `~/.claude` (and macOS Keychain), same as before |
+| `copilot` | off | GitHub Copilot **premium-request** quota (used / remaining, monthly reset) | Auto-detected — see below |
+
+Toggle a provider at runtime via right-click → **Providers ▸**; the choice persists to `config.json`.
+
+### GitHub Copilot authentication
+
+No setup is needed if you already use Copilot in an editor. With `"token": null` the widget auto-detects a GitHub token, in order:
+
+1. `~/.config/github-copilot/apps.json` — the OAuth token the Copilot editor plugins (VS Code, JetBrains, Neovim, …) cache.
+2. The [`gh` CLI](https://cli.github.com/) — `gh auth token`, or `~/.config/gh/hosts.yml`.
+3. The `GH_TOKEN` / `GITHUB_TOKEN` environment variables.
+
+To pin a specific token instead, set `"token": "ghp_…"` under `providers.copilot`.
+
+> **Note:** Copilot has no public per-user quota API, so the widget reads the same internal endpoint (`api.github.com/copilot_internal/user`) the editors use. It is undocumented and may change; the widget parses it defensively and falls back to the last known value on any hiccup. Some plans report premium requests as *unlimited*, which renders as an `∞` badge rather than a gauge.
 
 ## Themes
 

@@ -12,6 +12,7 @@ from unittest.mock import patch
 from claude_usage import __version__
 from claude_usage.cli import build_parser, run_cli
 from claude_usage.collector import UsageStats
+from claude_usage.providers.anthropic import snapshot_from_stats
 
 
 def _fake_stats() -> UsageStats:
@@ -21,6 +22,11 @@ def _fake_stats() -> UsageStats:
         today_tokens=1_234_567,
         today_cost=12.34,
     )
+
+
+def _fake_snapshots():
+    """The collect_snapshots() return shape the CLI now consumes."""
+    return [snapshot_from_stats(_fake_stats())]
 
 
 class TestBuildParser(unittest.TestCase):
@@ -61,7 +67,7 @@ class TestRunCli(unittest.TestCase):
 
     def test_json_emits_valid_json(self):
         out = StringIO()
-        with patch("claude_usage.cli.collect_all", return_value=_fake_stats()), \
+        with patch("claude_usage.cli.collect_snapshots", return_value=_fake_snapshots()), \
              patch("sys.stdout", out):
             rc = run_cli(["--json"])
         self.assertEqual(rc, 0)
@@ -71,7 +77,7 @@ class TestRunCli(unittest.TestCase):
 
     def test_field_emits_single_value(self):
         out = StringIO()
-        with patch("claude_usage.cli.collect_all", return_value=_fake_stats()), \
+        with patch("claude_usage.cli.collect_snapshots", return_value=_fake_snapshots()), \
              patch("sys.stdout", out):
             rc = run_cli(["--field", "session_utilization"])
         self.assertEqual(rc, 0)
@@ -79,7 +85,7 @@ class TestRunCli(unittest.TestCase):
 
     def test_unknown_field_returns_error(self):
         err = StringIO()
-        with patch("claude_usage.cli.collect_all", return_value=_fake_stats()), \
+        with patch("claude_usage.cli.collect_snapshots", return_value=_fake_snapshots()), \
              patch("sys.stderr", err):
             rc = run_cli(["--field", "bogus_field"])
         self.assertEqual(rc, 2)
